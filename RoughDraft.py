@@ -1,22 +1,27 @@
 from __future__ import annotations
 
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 import pandas as pd
 
 
-# =========================
-# CONFIG (change this)
-# =========================
-TARGET_EPOCH_SECONDS = 60  # e.g., 60 for 1-min, 30 for 30s, etc.
-OUT_SUFFIX = "_compressed"
-
-
 DELIM = ";"
 DATETIME_COL = "DATE/TIME"
+OUTPUT_COLUMNS = [
+    "DATE/TIME",
+    "EVENT",
+    "EXT TEMPERATURE",
+    "PIM",
+    "PIMn",
+    "ZCM",
+    "ZCMn",
+    "LIGHT",
+    "STATE",
+]
 
 
 def fmt_float_trim(x: float, max_decimals: int) -> str:
@@ -35,8 +40,8 @@ def find_data_header_line(lines: list[str]) -> int:
 
 
 def build_output_path(in_path: Path, epoch_s: int) -> Path:
-    # Example: file.txt -> file_compressed_60s.txt
-    return in_path.with_name(f"{in_path.stem}{OUT_SUFFIX}_{epoch_s}s{in_path.suffix}")
+    # Example: file.txt -> file_Condor_60s.txt
+    return in_path.with_name(f"{in_path.stem}_Condor_{epoch_s}s{in_path.suffix}")
 
 
 def mode_series(x: pd.Series):
@@ -45,9 +50,6 @@ def mode_series(x: pd.Series):
 
 
 def main() -> None:
-    if not isinstance(TARGET_EPOCH_SECONDS, int) or TARGET_EPOCH_SECONDS <= 0:
-        raise ValueError("TARGET_EPOCH_SECONDS must be a positive integer.")
-
     # --- File picker ---
     root = tk.Tk()
     root.withdraw()
@@ -55,13 +57,23 @@ def main() -> None:
         title="Select MotionLogger/Condor TXT export",
         filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
     )
+    if not in_file:
+        root.destroy()
+        return
+
+    target_epoch_seconds = simpledialog.askinteger(
+        "Epoch Duration",
+        "Enter the epoch duration in seconds to condense the file to:",
+        minvalue=1,
+        parent=root,
+    )
     root.destroy()
 
-    if not in_file:
+    if target_epoch_seconds is None:
         return
 
     in_path = Path(in_file)
-    out_path = build_output_path(in_path, TARGET_EPOCH_SECONDS)
+    out_path = build_output_path(in_path, target_epoch_seconds)
 
     # --- Read full file (keep header exactly) ---
     text = in_path.read_text(encoding="utf-8", errors="replace")
@@ -73,7 +85,6 @@ def main() -> None:
         messagebox.showerror("Parse error", f"{e}")
         return
 
-    preamble_lines = lines[:header_idx]          # everything before the data header line
     table_header_line = lines[header_idx]        # "DATE/TIME;EVENT;EXT TEMPERATURE;..."
     data_lines = lines[header_idx + 1 :]         # everything after the header line
 
@@ -82,8 +93,6 @@ def main() -> None:
     if not header_cols or header_cols[0] != DATETIME_COL:
         messagebox.showerror("Parse error", "Unexpected table header format.")
         return
-
-    data_cols = header_cols[1:]  # columns after DATE/TIME (preserve this order)
 
     # --- Load data into pandas ---
     table_text = table_header_line + "\n" + "\n".join(data_lines)
@@ -102,7 +111,7 @@ def main() -> None:
         df[col] = pd.to_numeric(df[col], errors="ignore")
 
     # --- Build aggregation rules ---
-    # IMPORTANT: We ignore original ZCMn entirely and compute it from aggregated ZCM later.
+    # IMPORTANT: We ignore original ZCMn/PIMn entirely and compute them from aggregated values later.
     # Default behavior:
     # - EVENT, PIM, ZCM -> SUM across the window
     # - EXT TEMPERATURE, LIGHT -> MEAN
@@ -110,7 +119,7 @@ def main() -> None:
     agg = {}
     for col in df.columns:
         cu = str(col).upper()
-        if cu == "ZCMN":
+        if cu in {"ZCMN", "PIMN"}:
             continue  # ignore original ZCMn input entirely
         if cu == "STATE":
             agg[col] = mode_series
@@ -119,18 +128,21 @@ def main() -> None:
         else:
             agg[col] = "sum"
 
-    rule = f"{TARGET_EPOCH_SECONDS}S"
+    rule = f"{target_epoch_seconds}S"
     df_res = df.resample(rule).agg(agg)
 
-    # --- Compute NEW ZCMn from aggregated ZCM / epoch_length_seconds ---
-    # Only if ZCM exists in either the input or the header list (we'll write it if header expects it).
-    if "ZCM" in df_res.columns:
-        df_res["ZCMn"] = df_res["ZCM"] / float(TARGET_EPOCH_SECONDS)
+    # --- Compute NEW PIMn/ZCMn from aggregated values / epoch_length_seconds ---
+    if "PIM" in df_res.columns:
+        df_res["PIMn"] = df_res["PIM"] / float(target_epoch_seconds)
     else:
-        # If no ZCM exists, still create ZCMn column if needed (will output blank)
+        df_res["PIMn"] = pd.NA
+
+    if "ZCM" in df_res.columns:
+        df_res["ZCMn"] = df_res["ZCM"] / float(target_epoch_seconds)
+    else:
         df_res["ZCMn"] = pd.NA
 
-    # --- Build output rows, preserving original header/order ---
+    # --- Build output rows, preserving Condor header/order ---
     dt_str = df_res.index.strftime("%d/%m/%Y %H:%M:%S")
 
     rows_out = []
@@ -138,7 +150,7 @@ def main() -> None:
         parts = [ts]
         row = df_res.iloc[i]
 
-        for col in data_cols:
+        for col in OUTPUT_COLUMNS[1:]:
             cu = col.upper()
 
             # Pull value (blank if missing)
@@ -148,6 +160,8 @@ def main() -> None:
                 parts.append("" if pd.isna(v) else str(int(round(float(v)))))
             elif cu == "PIM":
                 parts.append(fmt_float_trim(v, 6))
+            elif cu == "PIMN":
+                parts.append(fmt_float_trim(v, 15))
             elif cu == "ZCMN":
                 # NEW computed ZCMn: ZCM / epoch_seconds
                 # Use up to 3 decimals (trimmed) so 20.000 -> "20"
@@ -161,15 +175,35 @@ def main() -> None:
 
         rows_out.append(DELIM.join(parts))
 
-    # --- Write output in same format (header unchanged, 1 line per epoch) ---
+    # --- Write output in Condor format (header updated, 1 line per epoch) ---
+    if df_res.empty:
+        messagebox.showerror("No data", "No epochs were found after resampling.")
+        return
+
+    created_at = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    first_epoch = df_res.index.min().strftime("%d/%m/%Y %H:%M:%S")
+    last_epoch = df_res.index.max().strftime("%d/%m/%Y %H:%M:%S")
+
     out_lines = []
-    out_lines.extend(preamble_lines)
-    out_lines.append(table_header_line)
+    out_lines.extend(
+        [
+            "+-------------+ MotionLogger Conversion to Condor Report +-------------+",
+            f"SUBJECT_NAME : {in_path.stem}",
+            "SUBJECT_DESCRIPTION :",
+            "DEVICE_ID : Micro MotionLogger",
+            f"FILE_DATE_TIME : {created_at}",
+            f"Collection_Start: {first_epoch}",
+            f"Collection_End: {last_epoch}",
+            f"Epoch_Duration:  {target_epoch_seconds}",
+            "+----------------------------------------------------------------------+",
+        ]
+    )
+    out_lines.append(DELIM.join(OUTPUT_COLUMNS))
     out_lines.extend(rows_out)
 
     out_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
-    messagebox.showinfo("Done", f"Saved compressed epoch file:\n{out_path}")
+    messagebox.showinfo("Done", f"Saved Condor file:\n{out_path}")
 
 
 if __name__ == "__main__":
